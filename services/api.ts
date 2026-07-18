@@ -93,7 +93,25 @@ export class API {
       throw new Error("API_URL_NOT_SET");
     }
 
-    const response = await fetch(`${this.baseURL}${url}`, options);
+    // 从 AsyncStorage 读取存储的 cookie 并附加到请求头
+    const storedCookie = await AsyncStorage.getItem('authCookies');
+    const headers: Record<string, string> = {
+      ...(options.headers as Record<string, string> || {}),
+    };
+    if (storedCookie) {
+      headers['Cookie'] = storedCookie;
+    }
+
+    const response = await fetch(`${this.baseURL}${url}`, {
+      ...options,
+      headers,
+    });
+
+    // 更新 cookie（服务器可能返回新的 Set-Cookie）
+    const newCookie = response.headers.get("Set-Cookie");
+    if (newCookie) {
+      await AsyncStorage.setItem("authCookies", newCookie);
+    }
 
     if (response.status === 401) {
       throw new Error("UNAUTHORIZED");
