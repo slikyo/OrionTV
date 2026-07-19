@@ -1,4 +1,4 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import CookieManager from "@react-native-cookies/cookies";
 
 // region: --- Interface Definitions ---
 export interface DoubanItem {
@@ -93,25 +93,24 @@ export class API {
       throw new Error("API_URL_NOT_SET");
     }
 
-    // 从 AsyncStorage 读取存储的 cookie 并附加到请求头
-    const storedCookie = await AsyncStorage.getItem('authCookies');
+    const fullUrl = `${this.baseURL}${url}`;
+
+    // 从原生 CookieStore 读取 cookie 并附加到请求头
+    const nativeCookies = await CookieManager.get(fullUrl);
     const headers: Record<string, string> = {
       ...(options.headers as Record<string, string> || {}),
     };
-    if (storedCookie) {
-      headers['Cookie'] = storedCookie;
+    const cookieParts = Object.entries(nativeCookies)
+      .filter(([, val]) => val && typeof val === "object" && "value" in val)
+      .map(([key, val]) => `${key}=${(val as { value: string }).value}`);
+    if (cookieParts.length > 0) {
+      headers["Cookie"] = cookieParts.join("; ");
     }
 
-    const response = await fetch(`${this.baseURL}${url}`, {
+    const response = await fetch(fullUrl, {
       ...options,
       headers,
     });
-
-    // 更新 cookie（服务器可能返回新的 Set-Cookie）
-    const newCookie = response.headers.get("Set-Cookie");
-    if (newCookie) {
-      await AsyncStorage.setItem("authCookies", newCookie);
-    }
 
     if (response.status === 401) {
       throw new Error("UNAUTHORIZED");
@@ -131,12 +130,7 @@ export class API {
       body: JSON.stringify({ username, password }),
     });
 
-    // 存储cookie到AsyncStorage
-    const cookies = response.headers.get("Set-Cookie");
-    if (cookies) {
-      await AsyncStorage.setItem("authCookies", cookies);
-    }
-
+    // Cookie 由原生 CookieStore 自动管理，无需手动存储
     return response.json();
   }
 
@@ -144,7 +138,7 @@ export class API {
     const response = await this._fetch("/api/logout", {
       method: "POST",
     });
-    await AsyncStorage.setItem("authCookies", '');
+    await CookieManager.clearAll();
     return response.json();
   }
 

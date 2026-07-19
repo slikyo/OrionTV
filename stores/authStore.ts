@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import CookieManager from "@react-native-cookies/cookies";
 import { api } from "@/services/api";
 import { useSettingsStore } from "./settingsStore";
 import Toast from "react-native-toast-message";
@@ -57,8 +57,10 @@ const useAuthStore = create<AuthState>((set) => ({
         return;
       }
 
-      const authToken = await AsyncStorage.getItem('authCookies');
-      if (!authToken) {
+      const cookies = api.baseURL ? await CookieManager.get(api.baseURL) : {};
+      const hasCookies = Object.keys(cookies).length > 0;
+
+      if (!hasCookies) {
         if (serverConfig && serverConfig.StorageType === "localstorage") {
           const loginResult = await api.login().catch(() => {
             set({ isLoggedIn: false, isLoginModalVisible: true });
