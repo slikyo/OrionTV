@@ -1,11 +1,19 @@
 import { create } from "zustand";
-import CookieManager from "@react-native-cookies/cookies";
 import { api } from "@/services/api";
+import { LoginCredentialsManager } from "@/services/storage";
 import { useSettingsStore } from "./settingsStore";
 import Toast from "react-native-toast-message";
 import Logger from "@/utils/Logger";
 
-const logger = Logger.withTag('AuthStore');
+const logger = Logger.withTag("AuthStore");
+
+// 用户主动退出后，本次进程内不再自动登录
+let suppressAutoLogin = false;
+let checkLoginInFlight: Promise<void> | null = null;
+
+export const allowAutoLogin = () => {
+  suppressAutoLogin = false;
+};
 
 interface AuthState {
   isLoggedIn: boolean;
@@ -16,79 +24,120 @@ interface AuthState {
   logout: () => Promise<void>;
 }
 
+const waitForServerConfig = async () => {
+  const settingsState = useSettingsStore.getState();
+  let serverConfig = settingsState.serverConfig;
+
+  if (settingsState.isLoadingServerConfig) {
+    const maxWaitTime = 3000;
+    const checkInterval = 100;
+    let waitTime = 0;
+
+    while (waitTime < maxWaitTime) {
+      await new Promise((resolve) => setTimeout(resolve, checkInterval));
+      waitTime += checkInterval;
+      const currentState = useSettingsStore.getState();
+      if (!currentState.isLoadingServerConfig) {
+        serverConfig = currentState.serverConfig;
+        break;
+      }
+    }
+  }
+
+  return {
+    serverConfig,
+    isLoadingServerConfig: useSettingsStore.getState().isLoadingServerConfig,
+  };
+};
+
+const tryRestoreSession = async (isLocalStorage: boolean): Promise<boolean> => {
+  if (isLocalStorage) {
+    const loginResult = await api.login();
+    return Boolean(loginResult?.ok);
+  }
+
+  const credentials = await LoginCredentialsManager.get();
+  if (!credentials?.password) {
+    return false;
+  }
+
+  const loginResult = await api.login(credentials.username || undefined, credentials.password);
+  return Boolean(loginResult?.ok);
+};
+
 const useAuthStore = create<AuthState>((set) => ({
   isLoggedIn: false,
   isLoginModalVisible: false,
   showLoginModal: () => set({ isLoginModalVisible: true }),
   hideLoginModal: () => set({ isLoginModalVisible: false }),
   checkLoginStatus: async (apiBaseUrl?: string) => {
-    if (!apiBaseUrl) {
-      set({ isLoggedIn: false, isLoginModalVisible: false });
-      return;
+    if (checkLoginInFlight) {
+      return checkLoginInFlight;
     }
-    try {
-      // Wait for server config to be loaded if it's currently loading
-      const settingsState = useSettingsStore.getState();
-      let serverConfig = settingsState.serverConfig;
 
-      // If server config is loading, wait a bit for it to complete
-      if (settingsState.isLoadingServerConfig) {
-        // Wait up to 3 seconds for server config to load
-        const maxWaitTime = 3000;
-        const checkInterval = 100;
-        let waitTime = 0;
-
-        while (waitTime < maxWaitTime) {
-          await new Promise(resolve => setTimeout(resolve, checkInterval));
-          waitTime += checkInterval;
-          const currentState = useSettingsStore.getState();
-          if (!currentState.isLoadingServerConfig) {
-            serverConfig = currentState.serverConfig;
-            break;
-          }
-        }
-      }
-
-      if (!serverConfig?.StorageType) {
-        // Only show error if we're not loading and have tried to fetch the config
-        if (!settingsState.isLoadingServerConfig) {
-          Toast.show({ type: "error", text1: "请检查网络或者服务器地址是否可用" });
-        }
+    checkLoginInFlight = (async () => {
+      if (!apiBaseUrl) {
+        set({ isLoggedIn: false, isLoginModalVisible: false });
         return;
       }
+      try {
+        const { serverConfig, isLoadingServerConfig } = await waitForServerConfig();
 
-      const cookies = api.baseURL ? await CookieManager.get(api.baseURL) : {};
-      const hasCookies = Object.keys(cookies).length > 0;
-
-      if (!hasCookies) {
-        if (serverConfig && serverConfig.StorageType === "localstorage") {
-          const loginResult = await api.login().catch(() => {
-            set({ isLoggedIn: false, isLoginModalVisible: true });
-          });
-          if (loginResult && loginResult.ok) {
-            set({ isLoggedIn: true });
+        if (!serverConfig?.StorageType) {
+          if (!isLoadingServerConfig) {
+            Toast.show({ type: "error", text1: "请检查网络或者服务器地址是否可用" });
           }
-        } else {
-          set({ isLoggedIn: false, isLoginModalVisible: true });
+          return;
         }
-      } else {
-        set({ isLoggedIn: true, isLoginModalVisible: false });
-      }
-    } catch (error) {
-      logger.error("Failed to check login status:", error);
-      if (error instanceof Error && error.message === "UNAUTHORIZED") {
+
+        const isLocalStorage = serverConfig.StorageType === "localstorage";
+        const hasCookies = await api.hasAuthCookies();
+
+        if (hasCookies) {
+          set({ isLoggedIn: true, isLoginModalVisible: false });
+          return;
+        }
+
+        // 无有效会话时：localstorage 静默登录；否则用已保存账号密码自动登录
+        // 主动退出后本次进程内不自动登录
+        if (!suppressAutoLogin) {
+          try {
+            const restored = await tryRestoreSession(isLocalStorage);
+            if (restored) {
+              set({ isLoggedIn: true, isLoginModalVisible: false });
+              return;
+            }
+          } catch (error) {
+            logger.warn("Auto login failed:", error);
+          }
+        }
+
         set({ isLoggedIn: false, isLoginModalVisible: true });
-      } else {
-        set({ isLoggedIn: false });
+      } catch (error) {
+        logger.error("Failed to check login status:", error);
+        if (error instanceof Error && error.message === "UNAUTHORIZED") {
+          set({ isLoggedIn: false, isLoginModalVisible: true });
+        } else {
+          set({ isLoggedIn: false });
+        }
       }
+    })();
+
+    try {
+      await checkLoginInFlight;
+    } finally {
+      checkLoginInFlight = null;
     }
   },
   logout: async () => {
+    suppressAutoLogin = true;
     try {
       await api.logout();
-      set({ isLoggedIn: false, isLoginModalVisible: true });
     } catch (error) {
       logger.error("Failed to logout:", error);
+      await api.clearAuthCookies();
+    } finally {
+      set({ isLoggedIn: false, isLoginModalVisible: true });
     }
   },
 }));

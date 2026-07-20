@@ -1,4 +1,9 @@
 import CookieManager from "@react-native-cookies/cookies";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import Logger from "@/utils/Logger";
+
+const logger = Logger.withTag("API");
+const AUTH_COOKIES_KEY = "authCookies";
 
 // region: --- Interface Definitions ---
 export interface DoubanItem {
@@ -88,29 +93,229 @@ export class API {
     this.baseURL = url;
   }
 
-  private async _fetch(url: string, options: RequestInit = {}): Promise<Response> {
+  private extractSetCookieHeaders(response: Response): string[] {
+    const headers = response.headers as Headers & { getSetCookie?: () => string[] };
+    if (typeof headers.getSetCookie === "function") {
+      const list = headers.getSetCookie();
+      if (list?.length) {
+        return list;
+      }
+    }
+
+    const single = headers.get("set-cookie") || headers.get("Set-Cookie");
+    if (single) {
+      return [single];
+    }
+
+    const cookies: string[] = [];
+    headers.forEach((value, key) => {
+      if (key.toLowerCase() === "set-cookie") {
+        cookies.push(value);
+      }
+    });
+    return cookies;
+  }
+
+  private async cookieHeaderFromNative(url: string): Promise<string> {
+    try {
+      const nativeCookies = await CookieManager.get(url);
+      return Object.entries(nativeCookies)
+        .filter(([, val]) => val && typeof val === "object" && "value" in val)
+        .map(([key, val]) => `${key}=${(val as { value: string }).value}`)
+        .join("; ");
+    } catch (error) {
+      logger.warn("Failed to read native cookies:", error);
+      return "";
+    }
+  }
+
+  private async getAuthCookieHeader(url: string): Promise<string> {
+    const nativeHeader = await this.cookieHeaderFromNative(url);
+    if (nativeHeader) {
+      return nativeHeader;
+    }
+
+    try {
+      const stored = await AsyncStorage.getItem(AUTH_COOKIES_KEY);
+      if (stored) {
+        await this.restoreStoredCookies(stored);
+        return stored;
+      }
+    } catch (error) {
+      logger.warn("Failed to read stored cookies:", error);
+    }
+    return "";
+  }
+
+  private async restoreStoredCookies(cookieHeader: string): Promise<void> {
+    if (!this.baseURL || !cookieHeader) {
+      return;
+    }
+
+    const pairs = cookieHeader.split(";").map((part) => part.trim()).filter(Boolean);
+    for (const pair of pairs) {
+      const eq = pair.indexOf("=");
+      if (eq <= 0) {
+        continue;
+      }
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (!name) {
+        continue;
+      }
+      try {
+        await CookieManager.set(
+          this.baseURL,
+          {
+            name,
+            value,
+            path: "/",
+          },
+          true
+        );
+      } catch (error) {
+        logger.warn(`Failed to restore cookie ${name}:`, error);
+      }
+    }
+  }
+
+  private async persistCookiesFromResponse(url: string, response: Response): Promise<void> {
+    const setCookies = this.extractSetCookieHeaders(response);
+
+    for (const raw of setCookies) {
+      try {
+        // Android 优先用 setFromResponse 解析完整 Set-Cookie
+        if (typeof (CookieManager as any).setFromResponse === "function") {
+          await (CookieManager as any).setFromResponse(url, raw);
+        }
+      } catch (error) {
+        logger.warn("setFromResponse failed:", error);
+      }
+
+      const segments = raw.split(";").map((part) => part.trim()).filter(Boolean);
+      if (segments.length === 0) {
+        continue;
+      }
+
+      const [nameValue, ...attrs] = segments;
+      const eq = nameValue.indexOf("=");
+      if (eq <= 0) {
+        continue;
+      }
+
+      const cookie: {
+        name: string;
+        value: string;
+        path?: string;
+        domain?: string;
+        expires?: string;
+        secure?: boolean;
+        httpOnly?: boolean;
+      } = {
+        name: nameValue.slice(0, eq).trim(),
+        value: nameValue.slice(eq + 1).trim(),
+        path: "/",
+      };
+
+      for (const attr of attrs) {
+        const attrEq = attr.indexOf("=");
+        const key = (attrEq >= 0 ? attr.slice(0, attrEq) : attr).trim().toLowerCase();
+        const val = attrEq >= 0 ? attr.slice(attrEq + 1).trim() : undefined;
+        if (key === "path" && val) {
+          cookie.path = val;
+        } else if (key === "domain" && val) {
+          cookie.domain = val;
+        } else if (key === "expires" && val) {
+          cookie.expires = val;
+        } else if (key === "secure") {
+          cookie.secure = true;
+        } else if (key === "httponly") {
+          cookie.httpOnly = true;
+        }
+      }
+
+      try {
+        await CookieManager.set(url, cookie, true);
+      } catch (error) {
+        logger.warn(`Failed to set cookie ${cookie.name}:`, error);
+      }
+    }
+
+    // 优先使用原生 cookie；否则回退到 Set-Cookie 原文中的 name=value
+    let cookieHeader = await this.cookieHeaderFromNative(url);
+    if (!cookieHeader && setCookies.length > 0) {
+      cookieHeader = setCookies
+        .map((raw) => raw.split(";")[0]?.trim())
+        .filter(Boolean)
+        .join("; ");
+    }
+
+    if (cookieHeader) {
+      try {
+        await AsyncStorage.setItem(AUTH_COOKIES_KEY, cookieHeader);
+      } catch (error) {
+        logger.warn("Failed to persist cookies:", error);
+      }
+    }
+
+    // Android 需要 flush 才能把 cookie 真正持久化到磁盘
+    try {
+      if (typeof (CookieManager as any).flush === "function") {
+        await (CookieManager as any).flush();
+      }
+    } catch (error) {
+      logger.warn("CookieManager.flush failed:", error);
+    }
+  }
+
+  async clearAuthCookies(): Promise<void> {
+    try {
+      await CookieManager.clearAll(true);
+    } catch (error) {
+      logger.warn("Failed to clear native cookies:", error);
+    }
+    try {
+      await AsyncStorage.removeItem(AUTH_COOKIES_KEY);
+    } catch (error) {
+      logger.warn("Failed to clear stored cookies:", error);
+    }
+  }
+
+  async hasAuthCookies(): Promise<boolean> {
+    if (!this.baseURL) {
+      return false;
+    }
+    const header = await this.getAuthCookieHeader(this.baseURL);
+    return header.length > 0;
+  }
+
+  private async _rawFetch(url: string, options: RequestInit = {}): Promise<Response> {
     if (!this.baseURL) {
       throw new Error("API_URL_NOT_SET");
     }
 
     const fullUrl = `${this.baseURL}${url}`;
-
-    // 从原生 CookieStore 读取 cookie 并附加到请求头
-    const nativeCookies = await CookieManager.get(fullUrl);
     const headers: Record<string, string> = {
       ...(options.headers as Record<string, string> || {}),
     };
-    const cookieParts = Object.entries(nativeCookies)
-      .filter(([, val]) => val && typeof val === "object" && "value" in val)
-      .map(([key, val]) => `${key}=${(val as { value: string }).value}`);
-    if (cookieParts.length > 0) {
-      headers["Cookie"] = cookieParts.join("; ");
+
+    const cookieHeader = await this.getAuthCookieHeader(fullUrl);
+    if (cookieHeader) {
+      headers["Cookie"] = cookieHeader;
     }
 
     const response = await fetch(fullUrl, {
       ...options,
       headers,
+      credentials: "include",
     });
+
+    await this.persistCookiesFromResponse(this.baseURL, response);
+    return response;
+  }
+
+  private async _fetch(url: string, options: RequestInit = {}): Promise<Response> {
+    const response = await this._rawFetch(url, options);
 
     if (response.status === 401) {
       throw new Error("UNAUTHORIZED");
@@ -124,22 +329,51 @@ export class API {
   }
 
   async login(username?: string | undefined, password?: string): Promise<{ ok: boolean }> {
-    const response = await this._fetch("/api/login", {
+    // 登录请求不要带旧 cookie，避免干扰新会话
+    if (!this.baseURL) {
+      throw new Error("API_URL_NOT_SET");
+    }
+
+    const fullUrl = `${this.baseURL}/api/login`;
+    const response = await fetch(fullUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
+      credentials: "include",
     });
 
-    // Cookie 由原生 CookieStore 自动管理，无需手动存储
-    return response.json();
+    await this.persistCookiesFromResponse(this.baseURL, response);
+
+    if (response.status === 401) {
+      throw new Error("UNAUTHORIZED");
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // 部分 RN 环境读不到 Set-Cookie：用凭证标记会话仍成功（冷启动会自动重登）
+    const hasCookies = await this.hasAuthCookies();
+    if (!hasCookies) {
+      logger.warn("Login succeeded but no cookies were captured; cold-start will re-login with saved credentials");
+    }
+
+    return data;
   }
 
   async logout(): Promise<{ ok: boolean }> {
-    const response = await this._fetch("/api/logout", {
-      method: "POST",
-    });
-    await CookieManager.clearAll();
-    return response.json();
+    try {
+      const response = await this._fetch("/api/logout", {
+        method: "POST",
+      });
+      await this.clearAuthCookies();
+      return response.json();
+    } catch (error) {
+      await this.clearAuthCookies();
+      throw error;
+    }
   }
 
   async getServerConfig(): Promise<ServerConfig> {
