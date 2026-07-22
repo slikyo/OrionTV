@@ -51,12 +51,27 @@ const waitForServerConfig = async () => {
 };
 
 const tryRestoreSession = async (isLocalStorage: boolean): Promise<boolean> => {
+  const credentials = await LoginCredentialsManager.get();
+
   if (isLocalStorage) {
+    if (credentials?.password) {
+      try {
+        const loginResult = await api.login(undefined, credentials.password);
+        return Boolean(loginResult?.ok);
+      } catch (error) {
+        // A password may have been removed from the server configuration. In that
+        // case the credentialed request returns ok without an auth session, so
+        // retry once as the supported passwordless localstorage flow.
+        if (!(error instanceof Error) || error.message !== "AUTH_SESSION_NOT_AVAILABLE") {
+          throw error;
+        }
+      }
+    }
+
     const loginResult = await api.login();
     return Boolean(loginResult?.ok);
   }
 
-  const credentials = await LoginCredentialsManager.get();
   if (!credentials?.password) {
     return false;
   }

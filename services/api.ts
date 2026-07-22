@@ -4,6 +4,7 @@ import Logger from "@/utils/Logger";
 
 const logger = Logger.withTag("API");
 const AUTH_COOKIES_KEY = "authCookies";
+const AUTH_COOKIE_NAME = "auth";
 
 // region: --- Interface Definitions ---
 export interface DoubanItem {
@@ -80,8 +81,16 @@ export interface ServerConfig {
   StorageType: "localstorage" | "redis" | string;
 }
 
+export interface LoginResponse {
+  ok: boolean;
+  token?: string;
+  auth?: Record<string, unknown>;
+  error?: string;
+}
+
 export class API {
   public baseURL: string = "";
+  private authCookieHeader: string = "";
 
   constructor(baseURL?: string) {
     if (baseURL) {
@@ -90,6 +99,9 @@ export class API {
   }
 
   public setBaseUrl(url: string) {
+    if (url !== this.baseURL) {
+      this.authCookieHeader = "";
+    }
     this.baseURL = url;
   }
 
@@ -108,7 +120,7 @@ export class API {
     }
 
     const cookies: string[] = [];
-    headers.forEach((value, key) => {
+    headers.forEach((value: string, key: string) => {
       if (key.toLowerCase() === "set-cookie") {
         cookies.push(value);
       }
@@ -116,82 +128,162 @@ export class API {
     return cookies;
   }
 
+  private extractAuthCookieHeader(cookieHeader: string): string {
+    const pairs = cookieHeader.split(";").map((part) => part.trim()).filter(Boolean);
+    for (const pair of pairs) {
+      const eq = pair.indexOf("=");
+      if (eq <= 0 || pair.slice(0, eq).trim() !== AUTH_COOKIE_NAME) {
+        continue;
+      }
+
+      const value = pair.slice(eq + 1).trim();
+      return value ? `${AUTH_COOKIE_NAME}=${value}` : "";
+    }
+    return "";
+  }
+
   private async cookieHeaderFromNative(url: string): Promise<string> {
     try {
       const nativeCookies = await CookieManager.get(url);
-      return Object.entries(nativeCookies)
-        .filter(([, val]) => val && typeof val === "object" && "value" in val)
-        .map(([key, val]) => `${key}=${(val as { value: string }).value}`)
-        .join("; ");
+      const authEntry = Object.entries(nativeCookies).find(([key, value]) => {
+        if (key === AUTH_COOKIE_NAME) {
+          return true;
+        }
+        return Boolean(
+          value &&
+          typeof value === "object" &&
+          "name" in value &&
+          (value as { name?: string }).name === AUTH_COOKIE_NAME
+        );
+      });
+
+      if (!authEntry) {
+        return "";
+      }
+
+      const value = authEntry[1];
+      if (!value || typeof value !== "object" || !("value" in value)) {
+        return "";
+      }
+
+      const authValue = (value as { value?: string }).value;
+      return authValue ? `${AUTH_COOKIE_NAME}=${authValue}` : "";
     } catch (error) {
-      logger.warn("Failed to read native cookies:", error);
+      logger.warn("Failed to read native auth cookie:", error);
       return "";
     }
   }
 
   private async getAuthCookieHeader(url: string): Promise<string> {
+    if (this.authCookieHeader) {
+      return this.authCookieHeader;
+    }
+
     const nativeHeader = await this.cookieHeaderFromNative(url);
     if (nativeHeader) {
+      this.authCookieHeader = nativeHeader;
+      try {
+        await AsyncStorage.setItem(AUTH_COOKIES_KEY, nativeHeader);
+      } catch (error) {
+        logger.warn("Failed to back up native auth cookie:", error);
+      }
       return nativeHeader;
     }
 
     try {
       const stored = await AsyncStorage.getItem(AUTH_COOKIES_KEY);
+      const storedAuthHeader = stored ? this.extractAuthCookieHeader(stored) : "";
+      if (storedAuthHeader) {
+        this.authCookieHeader = storedAuthHeader;
+        if (storedAuthHeader !== stored) {
+          await AsyncStorage.setItem(AUTH_COOKIES_KEY, storedAuthHeader);
+        }
+        await this.restoreStoredCookies(storedAuthHeader);
+        return storedAuthHeader;
+      }
       if (stored) {
-        await this.restoreStoredCookies(stored);
-        return stored;
+        await AsyncStorage.removeItem(AUTH_COOKIES_KEY);
       }
     } catch (error) {
-      logger.warn("Failed to read stored cookies:", error);
+      logger.warn("Failed to read stored auth cookie:", error);
     }
     return "";
   }
 
   private async restoreStoredCookies(cookieHeader: string): Promise<void> {
-    if (!this.baseURL || !cookieHeader) {
+    if (!this.baseURL) {
       return;
     }
 
-    const pairs = cookieHeader.split(";").map((part) => part.trim()).filter(Boolean);
-    for (const pair of pairs) {
-      const eq = pair.indexOf("=");
-      if (eq <= 0) {
-        continue;
-      }
-      const name = pair.slice(0, eq).trim();
-      const value = pair.slice(eq + 1).trim();
-      if (!name) {
-        continue;
-      }
-      try {
-        await CookieManager.set(
-          this.baseURL,
-          {
-            name,
-            value,
-            path: "/",
-          },
-          true
-        );
-      } catch (error) {
-        logger.warn(`Failed to restore cookie ${name}:`, error);
-      }
+    const authHeader = this.extractAuthCookieHeader(cookieHeader);
+    if (!authHeader) {
+      return;
     }
+
+    const eq = authHeader.indexOf("=");
+    const value = authHeader.slice(eq + 1);
+    try {
+      await CookieManager.set(
+        this.baseURL,
+        {
+          name: AUTH_COOKIE_NAME,
+          value,
+          path: "/",
+        },
+        true
+      );
+    } catch (error) {
+      logger.warn("Failed to restore auth cookie:", error);
+    }
+  }
+
+  private async flushNativeCookies(): Promise<void> {
+    try {
+      if (typeof (CookieManager as any).flush === "function") {
+        await (CookieManager as any).flush();
+      }
+    } catch (error) {
+      logger.warn("CookieManager.flush failed:", error);
+    }
+  }
+
+  private async persistAuthToken(token: string): Promise<void> {
+    if (!token) {
+      return;
+    }
+
+    const cookieHeader = `${AUTH_COOKIE_NAME}=${token}`;
+    this.authCookieHeader = cookieHeader;
+
+    try {
+      await AsyncStorage.setItem(AUTH_COOKIES_KEY, cookieHeader);
+    } catch (error) {
+      logger.warn("Failed to persist login token:", error);
+    }
+
+    try {
+      await CookieManager.set(
+        this.baseURL,
+        {
+          name: AUTH_COOKIE_NAME,
+          value: token,
+          path: "/",
+        },
+        true
+      );
+    } catch (error) {
+      logger.warn("Failed to set native auth cookie from login token:", error);
+    }
+
+    await this.flushNativeCookies();
   }
 
   private async persistCookiesFromResponse(url: string, response: Response): Promise<void> {
     const setCookies = this.extractSetCookieHeaders(response);
+    let responseAuthHeader = "";
+    let authWasCleared = false;
 
     for (const raw of setCookies) {
-      try {
-        // Android 优先用 setFromResponse 解析完整 Set-Cookie
-        if (typeof (CookieManager as any).setFromResponse === "function") {
-          await (CookieManager as any).setFromResponse(url, raw);
-        }
-      } catch (error) {
-        logger.warn("setFromResponse failed:", error);
-      }
-
       const segments = raw.split(";").map((part) => part.trim()).filter(Boolean);
       if (segments.length === 0) {
         continue;
@@ -200,6 +292,29 @@ export class API {
       const [nameValue, ...attrs] = segments;
       const eq = nameValue.indexOf("=");
       if (eq <= 0) {
+        continue;
+      }
+
+      const name = nameValue.slice(0, eq).trim();
+      if (name !== AUTH_COOKIE_NAME) {
+        continue;
+      }
+
+      const value = nameValue.slice(eq + 1).trim();
+      authWasCleared = !value;
+      if (value) {
+        responseAuthHeader = `${AUTH_COOKIE_NAME}=${value}`;
+      }
+
+      try {
+        if (typeof (CookieManager as any).setFromResponse === "function") {
+          await (CookieManager as any).setFromResponse(url, raw);
+        }
+      } catch (error) {
+        logger.warn("setFromResponse failed:", error);
+      }
+
+      if (!value) {
         continue;
       }
 
@@ -212,21 +327,21 @@ export class API {
         secure?: boolean;
         httpOnly?: boolean;
       } = {
-        name: nameValue.slice(0, eq).trim(),
-        value: nameValue.slice(eq + 1).trim(),
+        name: AUTH_COOKIE_NAME,
+        value,
         path: "/",
       };
 
       for (const attr of attrs) {
         const attrEq = attr.indexOf("=");
         const key = (attrEq >= 0 ? attr.slice(0, attrEq) : attr).trim().toLowerCase();
-        const val = attrEq >= 0 ? attr.slice(attrEq + 1).trim() : undefined;
-        if (key === "path" && val) {
-          cookie.path = val;
-        } else if (key === "domain" && val) {
-          cookie.domain = val;
-        } else if (key === "expires" && val) {
-          cookie.expires = val;
+        const attrValue = attrEq >= 0 ? attr.slice(attrEq + 1).trim() : undefined;
+        if (key === "path" && attrValue) {
+          cookie.path = attrValue;
+        } else if (key === "domain" && attrValue) {
+          cookie.domain = attrValue;
+        } else if (key === "expires" && attrValue) {
+          cookie.expires = attrValue;
         } else if (key === "secure") {
           cookie.secure = true;
         } else if (key === "httponly") {
@@ -237,38 +352,35 @@ export class API {
       try {
         await CookieManager.set(url, cookie, true);
       } catch (error) {
-        logger.warn(`Failed to set cookie ${cookie.name}:`, error);
+        logger.warn("Failed to set native auth cookie:", error);
       }
     }
 
-    // 优先使用原生 cookie；否则回退到 Set-Cookie 原文中的 name=value
-    let cookieHeader = await this.cookieHeaderFromNative(url);
-    if (!cookieHeader && setCookies.length > 0) {
-      cookieHeader = setCookies
-        .map((raw) => raw.split(";")[0]?.trim())
-        .filter(Boolean)
-        .join("; ");
+    if (!responseAuthHeader && !authWasCleared) {
+      responseAuthHeader = await this.cookieHeaderFromNative(url);
     }
 
-    if (cookieHeader) {
+    if (responseAuthHeader) {
+      this.authCookieHeader = responseAuthHeader;
       try {
-        await AsyncStorage.setItem(AUTH_COOKIES_KEY, cookieHeader);
+        await AsyncStorage.setItem(AUTH_COOKIES_KEY, responseAuthHeader);
       } catch (error) {
-        logger.warn("Failed to persist cookies:", error);
+        logger.warn("Failed to persist auth cookie:", error);
+      }
+    } else if (authWasCleared) {
+      this.authCookieHeader = "";
+      try {
+        await AsyncStorage.removeItem(AUTH_COOKIES_KEY);
+      } catch (error) {
+        logger.warn("Failed to clear stored auth cookie:", error);
       }
     }
 
-    // Android 需要 flush 才能把 cookie 真正持久化到磁盘
-    try {
-      if (typeof (CookieManager as any).flush === "function") {
-        await (CookieManager as any).flush();
-      }
-    } catch (error) {
-      logger.warn("CookieManager.flush failed:", error);
-    }
+    await this.flushNativeCookies();
   }
 
   async clearAuthCookies(): Promise<void> {
+    this.authCookieHeader = "";
     try {
       await CookieManager.clearAll(true);
     } catch (error) {
@@ -277,7 +389,7 @@ export class API {
     try {
       await AsyncStorage.removeItem(AUTH_COOKIES_KEY);
     } catch (error) {
-      logger.warn("Failed to clear stored cookies:", error);
+      logger.warn("Failed to clear stored auth cookie:", error);
     }
   }
 
@@ -286,7 +398,7 @@ export class API {
       return false;
     }
     const header = await this.getAuthCookieHeader(this.baseURL);
-    return header.length > 0;
+    return Boolean(this.extractAuthCookieHeader(header));
   }
 
   private async _rawFetch(url: string, options: RequestInit = {}): Promise<Response> {
@@ -328,7 +440,7 @@ export class API {
     return response;
   }
 
-  async login(username?: string | undefined, password?: string): Promise<{ ok: boolean }> {
+  async login(username?: string | undefined, password?: string): Promise<LoginResponse> {
     // 登录请求不要带旧 cookie，避免干扰新会话
     if (!this.baseURL) {
       throw new Error("API_URL_NOT_SET");
@@ -352,12 +464,22 @@ export class API {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as LoginResponse;
 
-    // 部分 RN 环境读不到 Set-Cookie：用凭证标记会话仍成功（冷启动会自动重登）
+    if (!data.ok) {
+      throw new Error(data.error || "UNAUTHORIZED");
+    }
+
+    // MoonTVPlus explicitly returns the auth cookie value as `token` because
+    // React Native commonly hides the Set-Cookie response header.
+    if (typeof data.token === "string" && data.token) {
+      await this.persistAuthToken(data.token);
+    }
+
     const hasCookies = await this.hasAuthCookies();
-    if (!hasCookies) {
-      logger.warn("Login succeeded but no cookies were captured; cold-start will re-login with saved credentials");
+    if (!hasCookies && password !== undefined) {
+      logger.warn("Login succeeded but MoonTVPlus did not provide a usable auth session");
+      throw new Error("AUTH_SESSION_NOT_AVAILABLE");
     }
 
     return data;
