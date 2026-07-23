@@ -86,15 +86,18 @@ const useAuthStore = create<AuthState>((set) => ({
   showLoginModal: () => set({ isLoginModalVisible: true }),
   hideLoginModal: () => set({ isLoginModalVisible: false }),
   checkLoginStatus: async (apiBaseUrl?: string) => {
+    // An early startup probe can run before settings have loaded. Do not let
+    // that no-op check occupy the in-flight slot needed by the real URL check.
+    if (!apiBaseUrl) {
+      set({ isLoggedIn: false, isLoginModalVisible: false });
+      return;
+    }
+
     if (checkLoginInFlight) {
       return checkLoginInFlight;
     }
 
     checkLoginInFlight = (async () => {
-      if (!apiBaseUrl) {
-        set({ isLoggedIn: false, isLoginModalVisible: false });
-        return;
-      }
       try {
         const { serverConfig, isLoadingServerConfig } = await waitForServerConfig();
 

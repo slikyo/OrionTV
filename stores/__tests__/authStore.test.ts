@@ -96,4 +96,24 @@ describe("authStore cold-start restoration", () => {
       isLoginModalVisible: false,
     });
   });
+
+  it("does not let an empty-url startup check suppress a configured-url check", async () => {
+    mockedSettingsStore.getState.mockReturnValue({
+      serverConfig: { SiteName: "MoonTVPlus", StorageType: "redis" },
+      isLoadingServerConfig: false,
+    });
+    mockedCredentials.get.mockResolvedValue({ username: "arthur", password: "secret" });
+    mockedApi.login.mockResolvedValue({ ok: true, token: "new-token" });
+
+    const emptyUrlCheck = useAuthStore.getState().checkLoginStatus();
+    const configuredUrlCheck = useAuthStore.getState().checkLoginStatus("https://moon.example.com");
+
+    await Promise.all([emptyUrlCheck, configuredUrlCheck]);
+
+    expect(mockedApi.login).toHaveBeenCalledWith("arthur", "secret");
+    expect(useAuthStore.getState()).toMatchObject({
+      isLoggedIn: true,
+      isLoginModalVisible: false,
+    });
+  });
 });
