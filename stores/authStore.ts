@@ -25,28 +25,29 @@ interface AuthState {
 }
 
 const waitForServerConfig = async () => {
-  const settingsState = useSettingsStore.getState();
-  let serverConfig = settingsState.serverConfig;
+  const maxWaitTime = 3000;
+  const checkInterval = 100;
+  let waitTime = 0;
+  let settingsState = useSettingsStore.getState();
+  let hasObservedConfigLoad = settingsState.isLoadingServerConfig;
 
-  if (settingsState.isLoadingServerConfig) {
-    const maxWaitTime = 3000;
-    const checkInterval = 100;
-    let waitTime = 0;
+  // Startup publishes apiBaseUrl before the config request is observable, so
+  // keep reading fresh state during the existing bounded initialization window.
+  while (!settingsState.serverConfig && waitTime < maxWaitTime) {
+    await new Promise((resolve) => setTimeout(resolve, checkInterval));
+    waitTime += checkInterval;
+    settingsState = useSettingsStore.getState();
 
-    while (waitTime < maxWaitTime) {
-      await new Promise((resolve) => setTimeout(resolve, checkInterval));
-      waitTime += checkInterval;
-      const currentState = useSettingsStore.getState();
-      if (!currentState.isLoadingServerConfig) {
-        serverConfig = currentState.serverConfig;
-        break;
-      }
+    if (settingsState.isLoadingServerConfig) {
+      hasObservedConfigLoad = true;
+    } else if (hasObservedConfigLoad) {
+      break;
     }
   }
 
   return {
-    serverConfig,
-    isLoadingServerConfig: useSettingsStore.getState().isLoadingServerConfig,
+    serverConfig: settingsState.serverConfig,
+    isLoadingServerConfig: settingsState.isLoadingServerConfig,
   };
 };
 

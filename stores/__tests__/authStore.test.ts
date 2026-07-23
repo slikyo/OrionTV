@@ -97,6 +97,150 @@ describe("authStore cold-start restoration", () => {
     });
   });
 
+  it("waits when server config starts loading just after the first state read", async () => {
+    jest.useFakeTimers();
+
+    try {
+      const serverConfig = { SiteName: "MoonTVPlus", StorageType: "redis" };
+      mockedSettingsStore.getState
+        .mockReturnValueOnce({ serverConfig: null, isLoadingServerConfig: false })
+        .mockReturnValueOnce({ serverConfig: null, isLoadingServerConfig: true })
+        .mockReturnValue({ serverConfig, isLoadingServerConfig: false });
+      mockedCredentials.get.mockResolvedValue({ username: "arthur", password: "secret" });
+      mockedApi.login.mockResolvedValue({ ok: true, token: "new-token" });
+
+      const loginCheck = useAuthStore
+        .getState()
+        .checkLoginStatus("https://moon.example.com");
+
+      await jest.runAllTimersAsync();
+      await loginCheck;
+
+      expect(mockedApi.login).toHaveBeenCalledWith("arthur", "secret");
+      expect(useAuthStore.getState()).toMatchObject({
+        isLoggedIn: true,
+        isLoginModalVisible: false,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("waits while server config is already loading", async () => {
+    jest.useFakeTimers();
+
+    try {
+      const serverConfig = { SiteName: "MoonTVPlus", StorageType: "redis" };
+      mockedSettingsStore.getState
+        .mockReturnValueOnce({ serverConfig: null, isLoadingServerConfig: true })
+        .mockReturnValue({ serverConfig, isLoadingServerConfig: false });
+      mockedCredentials.get.mockResolvedValue({ username: "arthur", password: "secret" });
+      mockedApi.login.mockResolvedValue({ ok: true, token: "new-token" });
+
+      const loginCheck = useAuthStore
+        .getState()
+        .checkLoginStatus("https://moon.example.com");
+
+      await jest.runAllTimersAsync();
+      await loginCheck;
+
+      expect(mockedApi.login).toHaveBeenCalledWith("arthur", "secret");
+      expect(useAuthStore.getState()).toMatchObject({
+        isLoggedIn: true,
+        isLoginModalVisible: false,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("stops waiting when server config loading finishes without a config", async () => {
+    jest.useFakeTimers();
+
+    try {
+      mockedSettingsStore.getState
+        .mockReturnValueOnce({ serverConfig: null, isLoadingServerConfig: true })
+        .mockReturnValue({ serverConfig: null, isLoadingServerConfig: false });
+
+      const loginCheck = useAuthStore
+        .getState()
+        .checkLoginStatus("https://moon.example.com");
+
+      await jest.runAllTimersAsync();
+      await loginCheck;
+
+      expect(mockedApi.login).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("bounds a missing-config wait and allows a later login check to retry", async () => {
+    jest.useFakeTimers();
+
+    try {
+      mockedSettingsStore.getState.mockReturnValue({
+        serverConfig: null,
+        isLoadingServerConfig: false,
+      });
+
+      const timedOutCheck = useAuthStore
+        .getState()
+        .checkLoginStatus("https://moon.example.com");
+
+      await jest.advanceTimersByTimeAsync(3000);
+      await timedOutCheck;
+
+      expect(mockedApi.login).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+
+      mockedSettingsStore.getState.mockReturnValue({
+        serverConfig: { SiteName: "MoonTVPlus", StorageType: "redis" },
+        isLoadingServerConfig: false,
+      });
+      mockedCredentials.get.mockResolvedValue({ username: "arthur", password: "secret" });
+      mockedApi.login.mockResolvedValue({ ok: true, token: "new-token" });
+
+      await useAuthStore.getState().checkLoginStatus("https://moon.example.com");
+
+      expect(mockedApi.login).toHaveBeenCalledTimes(1);
+      expect(mockedApi.login).toHaveBeenCalledWith("arthur", "secret");
+      expect(useAuthStore.getState()).toMatchObject({
+        isLoggedIn: true,
+        isLoginModalVisible: false,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("deduplicates concurrent login checks", async () => {
+    mockedSettingsStore.getState.mockReturnValue({
+      serverConfig: { SiteName: "MoonTVPlus", StorageType: "redis" },
+      isLoadingServerConfig: false,
+    });
+    mockedCredentials.get.mockResolvedValue({ username: "arthur", password: "secret" });
+    mockedApi.login.mockResolvedValue({ ok: true, token: "new-token" });
+
+    const firstCheck = useAuthStore
+      .getState()
+      .checkLoginStatus("https://moon.example.com");
+    const secondCheck = useAuthStore
+      .getState()
+      .checkLoginStatus("https://moon.example.com");
+
+    await Promise.all([firstCheck, secondCheck]);
+
+    expect(mockedApi.hasAuthCookies).toHaveBeenCalledTimes(1);
+    expect(mockedCredentials.get).toHaveBeenCalledTimes(1);
+    expect(mockedApi.login).toHaveBeenCalledTimes(1);
+    expect(useAuthStore.getState()).toMatchObject({
+      isLoggedIn: true,
+      isLoginModalVisible: false,
+    });
+  });
+
   it("does not let an empty-url startup check suppress a configured-url check", async () => {
     mockedSettingsStore.getState.mockReturnValue({
       serverConfig: { SiteName: "MoonTVPlus", StorageType: "redis" },

@@ -109,6 +109,22 @@ describe("API MoonTVPlus authentication", () => {
     );
   });
 
+  it("keeps manual username and password login behavior", async () => {
+    const token = "%7B%22username%22%3A%22alice%22%7D";
+    fetchMock.mockResolvedValueOnce(createJsonResponse({ ok: true, token }));
+
+    const api = new API(baseURL);
+
+    await expect(api.login("alice", "secret")).resolves.toEqual({ ok: true, token });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${baseURL}/api/login`,
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ username: "alice", password: "secret" }),
+      })
+    );
+  });
+
   it("sends the persisted JSON token on the first authenticated request after login", async () => {
     const token = "%7B%22username%22%3A%22alice%22%7D";
     fetchMock
